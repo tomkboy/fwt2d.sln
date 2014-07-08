@@ -1,0 +1,1511 @@
+Enter file contents here// fwt.cpp: implementation of the fwt class.
+//
+//////////////////////////////////////////////////////////////////////
+
+#include "stdafx.h"
+#include "fwt2d.h"
+#include "fwt.h"
+#include <fstream>
+#include <assert.h>
+#include "mat.h"
+#include "matrix.h"
+#include "global_func.h"
+#include "num_cal.h"
+#include "arithmetic_ansi.h"
+#include <stdlib.h>
+#include "SparseMatrix.h"
+#include <omp.h>
+#include "mex.h"
+
+#define lbfgsfloatval_t float
+using  namespace  std; 
+
+#ifdef _DEBUG
+#undef THIS_FILE
+static char THIS_FILE[]=__FILE__;
+#define new DEBUG_NEW
+#endif
+//#define ICNTL[i] icntl[ (i) - 1 ]
+
+
+//////////////////////////////////////////////////////////////////////
+// Construction/Destruction
+//////////////////////////////////////////////////////////////////////
+
+//初始值设定
+fwt::fwt()
+{	
+	//overtrust model
+	//m_nx = 801;	                      //x方向网格数
+   // m_nz = 187;                       //z方向网格数
+	//m_hx = 25;                         //x方向网格尺度
+	//m_hz = 25;                          //z方向网格尺度
+	//m_ShotNum = 200;             //炮点数
+	//m_RecNum = 200;               //接收点数
+	
+	//layer model
+	m_nx = 240;
+    m_nz = 90;
+	m_hx = 10;
+	m_hz = 10;
+	m_ShotNum = 60;
+	m_RecNum =60;
+
+	//marmousi model
+ 	/*m_nx = 737;	 
+ 	m_nz = 240;
+ 	m_hx = 12.5;
+ 	m_hz = 12.5;
+ 	m_ShotNum = 184;
+ 	m_RecNum = 184;*/
+	
+	//salt model 
+// 	m_nx = 1558;	
+// 	m_nz = 417;
+// 	m_hx = 10;
+// 	m_hz = 10;
+// 	m_ShotNum = 380;
+// 	m_RecNum = 380;
+
+	m_npmlx = 10;                   //PML层厚度
+	m_npmlz = 10;
+	m_decimation = 1;	          //采样数
+	//m_vel.assign(nn(),0);
+}
+
+fwt::~fwt()
+{
+
+}
+//震源设置
+double fwt::SourceG(int t, sType type)             
+{	    
+	if (type == Ricker)                                      //雷克子波
+	{
+		double time=0,result=0;
+		double Av=0,Bp=0;
+		double freq=8;										//频率的选择？
+		double t0=1.5*sqrt(6.0)/(PI*freq);
+		time=t*m_tstep;
+		Av=1-2*(PI*freq*(time-t0))*(PI*freq*(time-t0));
+		Bp=-(PI*freq*(time-t0))*(PI*freq*(time-t0));
+		result=Av*exp(Bp);
+		return result;
+	}
+	else if (type == Rickers)
+	{
+		double time2=0,result2=0;
+		double Av2=0,Bp2=0;
+		double freq2=8;										//频率的选择？
+		double t2=1.15/freq2;
+		time2=t*m_tstep;
+		Av2=1-2*(PI*freq2*(time2-t2))*(PI*freq2*(time2-t2));
+		Bp2=-(PI*freq2*(time2-t2))*(PI*freq2*(time2-t2));
+		result2=(1.2)*Av2*exp(Bp2);
+		return result2;;
+	}
+
+	else if(type == Sinex)
+	{
+		double time1,result1,atten=40.0;
+		double A=0,B=0;
+		double freq1=20;
+		double t1=1.5*sqrt(6.0)/(PI*freq1);
+		time1=t*m_tstep;
+		A=-(atten*atten*(time1-t1)*(time1-t1));
+		B=sin(2*PI*freq1*(time1-t1));
+		result1=B*exp(A);							//add   10   to close to Ricker
+		return result1;
+	}
+	else if(type== sincom)
+	{
+		double timecom,resultcom;
+		timecom=t*m_tstep;
+		resultcom=0.04*sin(1.7*timecom)-0.016*sin(2.44*timecom)+0.86*sin(4.63*timecom);
+		return resultcom;
+	}
+	else if( type == Dirac)
+	{
+		if (t == 0)
+		{
+			return 1.0;
+		}
+		else
+			return 0;
+	}
+
+	return 0;
+	//return chan[95].sample[t];
+
+}
+
+/*double fwt::SourceG(double t,sType type,double frequency)
+	{   
+		double time_=0,reslut_=0;
+		double freq_=frequency;
+		
+		time_=t*m_tstep;
+		reslut_=sin(freq_*time_);
+		return reslut_;
+}*/
+///////////////////////////////////////////
+//d1，d1b: Z方向PML层常规网格和交错网格的衰减处理
+//d2，d2b: X方向PML层常规网格和交错网格的衰减处理
+//////////////////////////////////////////
+void fwt::EvalMatrix(complex<float> *d1,complex<float> *d1b,complex<float> *d2,complex<float> *d2b,complex<float> omegac,float *ve)
+{
+	const float a=0.5461f;
+	const float c=0.6284f;
+	const float d=0.09381f;
+
+	complex<float> omegac2 = omegac*omegac;
+	float hx2 = 1/(m_hx*m_hx);                  
+	float hz2 = 1/(m_hz*m_hz);
+	int i1,i2;	
+	complex<float> d2p,d1p,d2m,d1m,temp;				//class	complex 
+
+	int nnz = 0;
+	//i1为深度方向，i2为水平方向
+	for (i2=0;i2<nxe();i2++)
+	{
+		for (i1=0;i1<nze();i1++)
+		{
+			d2p=d2b[i2];
+			d1p=d1b[i1];
+			d2m = (i2 > 0 ? d2b[i2-1] : d2b[0]);
+			d1m = (i1 > 0 ? d1b[i1-1] : d1b[0]);
+
+			int irn=kkindex(i1,i2)+1;
+
+			//Node 00
+			m_id.irn[nnz]=irn;
+			m_id.jcn[nnz]=kkindex(i1,i2) +1 ;
+			temp=c*omegac2/(ve[kkindex(i1,i2)]*ve[kkindex(i1,i2)])
+				-(1-a)*0.5f*(hx2*d2[i2]*(d2p+d2m)+hz2*d1[i1]*(d1p+d1m))
+				+a*(-hx2*d2[i2]*(d2p+d2m)-hz2*d1[i1]*(d1p+d1m));
+			m_id.a[nnz].r =temp.real();
+			m_id.a[nnz].i = temp.imag();
+			nnz++;
+
+			//Node 01
+			if (i2 < nxe()-1)
+			{
+				m_id.irn[nnz]=irn;
+				m_id.jcn[nnz] = kkindex(i1,i2+1) +1;
+				temp=d*omegac2/(ve[kkindex(i1,i2+1)]*ve[kkindex(i1,i2+1)])
+					+(1-a)*0.5f*(hx2*d2[i2]*d2p-hz2*d1[i1]*(d1p+d1m)*0.5f)
+					+a*hx2*d2[i2]*d2p;
+				m_id.a[nnz].r =temp.real();
+				m_id.a[nnz].i = temp.imag();
+				nnz++;
+			}		
+
+			//Node 0-1
+			if (i2 > 0)
+			{
+				m_id.irn[nnz]=irn;
+				m_id.jcn[nnz]=kkindex(i1,i2-1) +1;
+				temp=d*omegac2/(ve[kkindex(i1,i2-1)]*ve[kkindex(i1,i2-1)])
+					+(1-a)*0.5f*(hx2*d2[i2]*d2m-hz2*d1[i1]*(d1p+d1m)*0.5f)
+					+a*hx2*d2[i2]*d2m;	
+				m_id.a[nnz].r =temp.real();
+				m_id.a[nnz].i = temp.imag();
+				nnz++;
+			}			
+
+			//Node -10
+			if (i1 > 0)
+			{
+				m_id.irn[nnz]=irn;
+				m_id.jcn[nnz]=kkindex(i1-1,i2) +1;
+				temp=d*omegac2/(ve[kkindex(i1-1,i2)]*ve[kkindex(i1-1,i2)])
+					+(1-a)*0.5f*(-hx2*d2[i2]*(d2p+d2m)*0.5f+hz2*d1[i1]*d1m)
+					+a*hz2*d1[i1]*d1m;
+				m_id.a[nnz].r =temp.real();
+				m_id.a[nnz].i = temp.imag();
+				nnz++;
+			}			
+
+			//Node 10
+			if (i1 < nze()-1)
+			{
+				m_id.irn[nnz]=irn;
+				m_id.jcn[nnz] = kkindex(i1+1,i2) +1;
+				temp=d*omegac2/(ve[kkindex(i1+1,i2)]*ve[kkindex(i1+1,i2)])
+					+(1-a)*0.5f*(-hx2*d2[i2]*(d2p+d2m)*0.5f+hz2*d1[i1]*d1p)
+					+a*hz2*d1[i1]*d1p;
+				m_id.a[nnz].r =temp.real();
+				m_id.a[nnz].i = temp.imag();
+				nnz++;
+			}			
+
+			//Node -11
+			if (i1 > 0 && i2 < nxe()-1)
+			{
+				m_id.irn[nnz]=irn;
+				m_id.jcn[nnz] = kkindex(i1-1,i2+1) +1;
+				temp=(1-a)*0.25f*(hx2*d2[i2]*d2p+hz2*d1[i1]*d1m);
+				m_id.a[nnz].r =temp.real();
+				m_id.a[nnz].i = temp.imag();
+				nnz++;
+			}			
+
+			//Node 1-1
+			if (i1 < nze()-1 && i2 >0)
+			{
+				m_id.irn[nnz]=irn;
+				m_id.jcn[nnz] = kkindex(i1+1,i2-1) +1;
+				temp=(1-a)*0.25f*(hx2*d2[i2]*d2m+hz2*d1[i1]*d1p);
+				m_id.a[nnz].r =temp.real();
+				m_id.a[nnz].i = temp.imag();
+				nnz++;
+			}			
+
+			//Node 11
+			if (i1<nze()-1 && i2<nxe()-1)
+			{
+				m_id.irn[nnz]=irn;
+				m_id.jcn[nnz] = kkindex(i1+1,i2+1) +1;
+				temp=(1-a)*0.25f*(hx2*d2[i2]*d2p+hz2*d1[i1]*d1p);
+				m_id.a[nnz].r =temp.real();
+				m_id.a[nnz].i = temp.imag();
+				nnz++;
+			}			
+
+			//Node -1-1
+			if (i1>0 && i2>0)
+			{
+				m_id.irn[nnz]=irn;
+				m_id.jcn[nnz] = kkindex(i1-1,i2-1) +1;
+				temp=(1-a)*0.25f*(hx2*d2[i2]*d2m+hz2*d1[i1]*d1m);
+				m_id.a[nnz].r =temp.real();
+				m_id.a[nnz].i = temp.imag();
+				nnz++;
+			}
+		}	
+	}
+	m_id.nz = nnz;	
+}
+
+//PML层衰减处理
+void fwt::Damp(int n, complex<float> *damp, complex<float> *dampb,complex<float> omegac,int npml)  //添加PML层
+{
+	const complex<float> CI(0,1);
+	int i=0;
+	float x,xb,eps,epsb;
+	for (i=0;i<n;i++)
+	{
+		damp[i]=1;
+		dampb[i]=1;
+	}
+	for (i=0;i<npml;i++)
+	{
+		x = (float)i;
+		xb = i + 0.5f;                                       //混合网格
+		eps=90*(1-cos((npml-x)*PI/(2*npml)));
+		epsb=90*(1-cos((npml-xb)*PI/(2*npml)));     //PML衰减
+		damp[i] = 1.0f/(1.0f-CI*eps/omegac);
+		dampb[i] = 1.0f/(1.0f-CI*epsb/omegac);
+		damp[n-i-1]=damp[i];                                  //对称
+	}
+
+	if (npml)
+	{
+		for (i=0;i<npml+1;i++)                              //对称另一边的PML处理
+		{
+			xb=n-1+0.5f-i;		
+			epsb=90*(1-cos((xb-(n-1-npml))*PI/(2*npml)));
+			dampb[n-i-1] = 1.0f/(1.0f-CI*epsb/omegac);
+		}
+	}
+}
+
+//波形正演
+void fwt:: FwtForward()
+{
+	//open velocity files	
+	 //OpenVelocity("E:\\Codes\\Marmousi模型\\Marmousi240.bin");//改：	
+
+//	m_decimation = 1;
+	m_vel.assign(nn(), 0);							//vel is size of wangge
+	m_ShotNum = 60;	
+	m_RecNum = 60;
+	ThreeLayer();        //改:层状模型
+	int nt = (int) (m_tsearch/m_tstep + 0.5);	//times of decimation
+	int ntnew = 1,r = 0;						//左移次数
+	while (ntnew < nt)
+	{
+		ntnew<<=1;
+		r++;
+	}	
+	complex<float>  *sourFFT  = new complex<float>[ntnew];  //FFT后的震源,分配存储空间	
+	ProcSource(nt,ntnew,r,sourFFT,Ricker);	
+	//ProcSource(nt,ntnew,r,sourFFT);
+	float wmax = 0.5f/m_tstep;//抽样定理
+	float dw = wmax / (0.5f*ntnew);
+	float wmax0 = 15;    //source的最大频率  2*8HZ
+	int nw = (int)(wmax0 / dw);
+
+	float *ve=new float[nne()];
+	Modetext(m_vel,ve);	
+
+	complex<float> *damp1p =new complex<float>[nze()];
+	complex<float> *damp1pb =new complex<float>[nze()];
+	complex<float> *damp2p =new complex<float>[nxe()];
+	complex<float> *damp2pb =new complex<float>[nxe()];
+
+	//地震记录
+	complex<float> (*sisFFT)[1024] =new complex<float>[m_RecNum][1024];  //receiver point
+	complex<float> (*sis)[1024] =new complex<float>[m_RecNum][1024];
+
+
+	//第一个接收点的坐标
+	//int RecX1 = (3000-2575)/(int)m_hx + m_npmlx;//m_offsetmax=2575  改
+	int RecX1 = 0/(int)m_hx + m_npmlx;
+	int RecZ1 = 0/(int)m_hz + m_npmlz;
+	
+	MumpsInitial();
+// 	engine *pEngine = engOpen(NULL);
+// 	if(!pEngine)
+// 	{
+// 		AfxMessageBox ("Can't start MATLAB engine");
+// 		exit(-1);
+// 	}
+
+	//循环计算每个频率点的振幅
+	for (int iw = 0;iw < nw;iw++)
+	{
+		float w = dw*(iw+1);
+		complex<float> omegac = 2*PI*w;				//w=2pi*f
+		//complex<float> omegac = complex<float>(omegac,-log(50.0f)/m_tsearch);
+		Damp(nze(),damp1p,damp1pb,omegac,m_npmlz);
+		Damp(nxe(),damp2p,damp2pb,omegac,m_npmlx);
+		EvalMatrix(damp1p,damp1pb,damp2p,damp2pb,omegac,ve);
+
+		SetNRhs(m_ShotNum,iw);
+
+		//gmres(pEngine);
+
+		m_id.job=6;
+		cmumps_c(&m_id);
+		assert(m_id.info[0] == 0);		
+
+		//DirectSolve();
+		//receive point	
+		for (int irec = 0; irec < m_RecNum; irec++)
+		{
+			int index = kkindex(RecZ1,RecX1+irec*4);//the distance between two receivers are two times of m_hx
+			sisFFT[irec][iw] = complex<float>(m_id.rhs[index].r, m_id.rhs[index].i) * sourFFT[iw];					
+		}			
+	}
+	//engClose(pEngine);
+
+	vector<float> real_sis(m_RecNum*nt);  
+	for (int i=0;i<m_RecNum;i++)
+	{
+		for (int j=nw;j<ntnew;j++)
+		{
+			sisFFT[i][j]=0;			
+		}		
+
+		IFFT(sisFFT[i],sis[i],r);		
+		//undamp(sis[i],nt);
+		// 		forwardfile <<i<<endl;
+		// 		for (int j = 0; j < nt; j++)
+		// 		{
+		// 			forwardfile <<sis[i][j].real() <<endl;
+		// 		}
+		// 		forwardfile <<endl;
+		for (int j = 0; j < nt; j++)
+		{
+			real_sis[i*nt+j] = sis[i][j].real();
+		}
+	}
+
+
+	SaveResult("mumps",real_sis,0);	
+	MumpsEnd();
+// 	m_id.job = -2; /* release library */
+// 	cmumps_c(&m_id);
+// 	delete []m_id.irn;
+// 	delete []m_id.jcn;
+// 	delete []m_id.a;
+// 	delete []m_id.rhs;
+
+	delete []damp1p;
+	delete []damp1pb;
+	delete []damp2p;
+	delete []damp2pb;
+	delete []sisFFT;
+	delete []sis;
+	delete []ve;
+}
+
+//波形反演主体
+void fwt::FwtInverse()      
+{	
+//	SaveResult("record",chan[95].sample,0);
+	int nt = 750;											//采样率4ms 时间3s
+	//ntnew is the smallest power of 2 greater than nt
+	int ntnew = 1,r = 0;
+	while (ntnew < nt)
+	{
+		ntnew<<=1;
+		r++;
+	}	
+	complex<float>  *sourFFT  = new complex<float>[ntnew];  //FFT后的震源	
+	ProcSource(nt,ntnew,r,sourFFT,Dirac);		            //震源处理-FFT变换
+	float fmax = 0.5f/m_tstep;
+	float df = fmax / (0.5f*ntnew);	
+
+	//int iiw[] = {329,411,575,820,1066,1312,1639};
+	//int iiw[] = {7,10,14,19,30,39,50};//marmousi 选取的频率点   add 25 
+	 int iiw[] = {7,10,14,19,30,39,50};
+	//int iiw[] = {4,7,10,14,19,30,39};//降低频率选择
+    //int iiw[] = {7,10,14,50,80,100};
+    //int iiw[] = {20, 28,40};
+	//int decimation[] = {4, 2, 2, 2, 2 ,1, 1};
+	float decimation[] = {1, 1, 1, 1, 1 ,1, 1,1,1};
+
+	int nw= sizeof(iiw) / sizeof(iiw[0]);					//number of w
+	int ns = 1;
+	MumpsInitial();
+
+	m_gobs.resize(nw*ns);								//调整大小
+	for(int  i = 0; i <nw*ns; i++) 
+	{
+		m_gobs[i].resize(ntrace());					//shot*recieve  not  nne()
+	}
+
+	//GetOberserveData(nt, r, ntnew, NW, iiw);	
+	ofstream sourcefile(".\\result\\source.txt");  	
+	ofstream costfile(".\\result\\cost.txt");  	
+	ofstream gradfile(".\\result\\grad.txt");  	
+
+	//OpenVelocity("E:\\Codes\\Marmousi模型\\Marmousi240.bin");//Marmousi240
+	//OpenVelocity("E:\\Codes\\Marmousi模型\\salt10m.bin");
+	//vector<float>   m_vel;
+	m_vel.assign(nn(), 0);
+	ThreeLayer();//改                        //真实模型
+	//HighVelocity();
+// 	vector<float> vel0(150*150);
+
+/* 	for (int i=0;i<150;i++)
+// 	{
+// 		for (int j=0;j<150;j++)
+// 		{
+// 			vel0[i*150+j] = m_vel[GetUstore(i+300,j)];
+// 		}
+// 	}
+// 	SaveResult("Vec150",vel0,0);
+// 	vector<float> vel(50*30);
+// 	for (int i=0;i< 50;i++)
+// 	{
+// 		for (int j=0;j<30;j++)
+// 		{
+// 			vel[i*30+j] = vel0[i*3*150+j*5];
+// // 			if (vel[i*30+j] > 2500)
+// // 			{
+// // 				vel[i*30+j] = 2500;
+// // 			}
+// 		}
+// 	}
+
+// 	for (int i = 0; i < nn(); i++)
+// 	{
+// 		m_vel[i] *= 1000;
+// 	}
+*/
+	SaveResult("VelTrue",m_vel,0);
+	
+	//compute the 'observed' data, the result is saved by m_gobs;
+	for (int iw = 0; iw < nw; iw++)                   //每个频率点正演
+	{
+		for (int ia = 0; ia < ns; ia++)
+		{
+
+			int ii = iiw[iw];	
+			complex<float> omegac = GetOmegac(ii, df, ia);
+			complex<float> sour = sourFFT[ii];
+			int is = iw*ns + ia;
+			sourcefile <<sour << endl;
+			SetNRhs(m_ShotNum,iw);
+			Forward(m_vel,omegac,sour,m_gobs[is]);	//正演获得实际数据，也就是理论数据。每次调用forward都是为了获得数据，所以hessian里面调用
+		}
+	}
+	sourcefile << endl;
+	MumpsEnd();											//foward is over
+
+
+	//INVERSE          反演
+	ProcSource(nt,ntnew,r,sourFFT,Dirac);	
+	vector<float> hess(nn());       //hessian
+	vector<float> grad(nn());      //gradient
+	//ProcSource(nt,ntnew,r,sourFFT,Sinex);                    //
+	//read start model Mar240Start.bin
+	//OpenVelocity("E:\\Codes\\Marmousi模型\\Smooth41.bin");/*Marmousi240.bin,Smooth41.bin.vel35*/   //改
+	IncreaseVelocity();
+	//ThreeLayer();
+	//ConstVelocity();
+	SaveResult("VelStart",m_vel,0);                     // 初始模型
+	//Createvelocitymat(-1);	
+	
+	for (int iw = 0; iw < nw; iw ++)             //每个频率点反演
+	{
+		for (int ia = 0; ia < ns; ia++)
+		{
+// 			m_decimation = decimation[iw];
+// 			m_hx *= m_decimation;
+// 			m_hz *= m_decimation;
+// 			m_nx /= m_decimation;
+// 			m_nz /= m_decimation;
+//  			m_ShotNum /= m_decimation;
+//  			m_RecNum /= m_decimation;
+// 			
+// 			for (int i = 0; i < m_nx; i++)               //变网格程序
+// 			{
+// 				for (int j = 0; j < m_nz; j++)
+// 				{
+// 					int index = i*m_decimation*m_decimation*m_nz+j*m_decimation;
+// 					m_vel[i*m_nz+j] = m_vel[index];
+// 				}
+// 			}
+
+// 			m_decimation = decimation[ia];
+// 			vector<float> tmpVel(m_vel);
+// 			m_nz /= m_decimation;
+// 			for (int i = 0; i < m_nx; i++)
+// 			{
+// 				for (int j = 0; j < m_nz; j++)
+// 				{
+// 					int index = i*m_nz*m_decimation+j;
+// 					m_vel[i*m_nz+j] = m_vel[index];
+// 				}
+// 			}
+		//	SaveResult("VecMultiGrid",m_vel,iw);
+
+			MumpsInitial();
+
+			int ii = iiw[iw];					//take of omegac
+			complex<float> omegac = GetOmegac(ii, df, ia);
+			complex<float> sour = sourFFT[ii];				//ProSource 已经fft过，也存储过sourceg，取值
+			float cost00 = 1e20f;		
+			//BFGS use the negative gradient(important!)
+			//L_BFGS(iw,omegac,sour);
+			int is = iw*ns + ia;
+
+			//PART1:COMPUTE THE HESSIAN	
+			GetHessian(omegac,sour,is,hess,sourcefile);	   //计算黑塞矩阵
+
+			for (int ita = 0; ita < 10; ita++)
+			{
+				//PART2:COMPUTE THE GRADIENT             
+				float cost0 = GetGradient(is,omegac,sour,grad);   //计算梯度
+				//float cost0=GetConjugateGradient(ita,iw,omegac,sour,grad,ConjGrad);
+				costfile<< is<<" "<<ita <<" "<<cost0 <<endl; 
+				 
+				//NOT CONVERGENCE,STOP ITERATIONS
+				if (cost0 > cost00 || fabs(cost0-cost00)< 0.01*cost00)  
+				{
+					costfile << "NOT CONVERGENCE" << endl;
+					break;
+				}
+				cost00 = cost0;   //最小梯度
+
+				//scale the gradient by the damped diagonal Hessian
+				ScaleGrad(hess,grad);                 //梯度预处理
+
+				//PART3: COMPUTE STEP LENGTH         //计算搜索步长
+				float alphamin = StepLength(cost0,grad,is,omegac,sour);       //最小步长
+				//float alphamin = StepLength(grad,hess);
+				if(alphamin == 0) 
+				{
+					costfile << "cannot find a step length" << endl;
+					break;
+				}
+
+				//update the velocity model 
+				for (int i = 0; i < nn(); i ++)	
+				{
+					m_vel[i] = m_vel[i] + alphamin * grad[i];			 //修正速度
+				}
+			}
+
+			
+			costfile << endl;	
+			
+// 			m_hx /= m_decimation;
+// 			m_hz /= m_decimation;
+// 			m_nx *= m_decimation;
+// 			m_nz *= m_decimation;
+//  			m_ShotNum *= m_decimation;
+//  			m_RecNum *= m_decimation;
+// 			for (int i = m_nx-1; i >=0; i--)
+// 			{
+// 				for (int j = m_nz-1; j >=0; j--)
+// 				{
+// 					m_vel[i*m_nz+j] = m_vel[ i/m_decimation*m_nz/m_decimation+j/m_decimation ];
+// 				}
+// 			}
+						
+// 			for (int i = 0; i < m_nx; i++)
+// 			{
+// 				for (int j = 0; j < m_nz; j++)
+// 				{
+// 					int index = i*m_nz*m_decimation+j;
+// 					tmpVel[index] = m_vel[i*m_nz+j];
+// 				}
+// 			}
+// 			m_nz *= m_decimation;
+// 			m_vel = tmpVel;
+			SaveResult("vel",m_vel,is);
+			SaveResult("grad",grad,is);
+			SaveResult("hess",hess,is);
+			//Createvelocitymat(iw);
+			MumpsEnd();
+
+		}
+	}	
+
+	//MumpsEnd();
+	//delete []sourFFT;	
+
+}
+
+void fwt::Forward(vector<float> &v,complex<float> omegac,complex<float> sour,vector<complex<float> > &gcal)
+{
+	complex<float> *damp1p =new complex<float>[nze()];
+	complex<float> *damp1pb =new complex<float>[nze()];
+	complex<float> *damp2p =new complex<float>[nxe()];
+	complex<float> *damp2pb =new complex<float>[nxe()];
+	float *ve=new float[nne()];	
+	Modetext(v,ve);
+	//SetNRhs(nRhs);
+	Damp(nze(),damp1p,damp1pb,omegac, m_npmlz);                        //添加PML衰减
+	Damp(nxe(),damp2p,damp2pb,omegac, m_npmlx);
+	EvalMatrix(damp1p,damp1pb,damp2p,damp2pb,omegac,ve);	     //交错网格处理
+	//func_mumps(nRhs,SparseRhs,sol);
+	m_id.job = 6;
+	cmumps_c(&m_id);
+
+	// 	if (m_id.info[0] )	
+	// 		AfxMessageBox("mumps wrong!");	
+	assert(m_id.info[0] == 0);
+
+	for (int is = 0; is < m_ShotNum; is++)	
+	{	
+		for (int ir=0; ir < m_RecNum; ir++)
+		{
+			//int index = nne()*is+kkindex(m_RecZ[ir],m_RecX[ir]);
+			int index = is * nne() + GetRecIndex(is,ir); 	
+			gcal[is*m_RecNum+ir] = complex<float>(m_id.rhs[index].r, m_id.rhs[index].i);
+			gcal[is*m_RecNum+ir]  *= sour;  //convolve
+					
+		}	
+	}
+
+	delete []damp1p;
+	delete []damp1pb;
+	delete []damp2p;
+	delete []damp2pb;
+	delete []ve;
+}
+
+//炮点设置
+void fwt::SetNRhs(int nRhs,int iw)
+{		
+	m_id.nrhs = nRhs;
+	memset(m_id.rhs, 0, 8*nne()*nRhs);	
+
+	//shots are all in the surface	
+	float sx = 0,sz = 0;
+	int isx = (int)(sx/m_hx) + m_npmlx;
+	int isz = (int)(sz/m_hz) + m_npmlx;							// m_npmlz?
+	int ds = 4;
+	for (int i=0;i<m_ShotNum;i++)
+	{	
+		int index = nne()*i + kkindex(isz, isx+ds*i);			//ds:    distance between shot
+		m_id.rhs[index].r =  -1.0f / (m_hx*m_hx);
+	}
+
+	// 	int np = 240;
+	// 	srand(iw*100);
+	// 	for (int i = 0; i < 240/np;i++)
+	// 	{
+	// 		for (int j = 0; j < np; j++)
+	// 		{
+	// 			int index =  nne()*i + kkindex(isz, isx+2*i);		
+	// 			float theat = rand()*2*PI / (RAND_MAX+1);
+	// 			complex<float> ci = complex<float>(0, 1);
+	// 			complex<float> tmp_rhs = -1.0f/**exp(ci*theat)*//(m_hx*m_hx);
+	// 			m_id.rhs[index].r =  tmp_rhs.real();
+	// 			m_id.rhs[index].i =  tmp_rhs.imag();
+	// 		}
+	// 		
+	// 
+	// 	}
+
+	// 	for (int i=0;i<m_ShotNum;i++)
+	// 	{	
+	// 		int isx = int(shot[i].pos.lx / m_hx) + m_npmlx;
+	// 		int isz = int(shot[i].pos.lz / m_hz) + m_npmlz;
+	// 		int index = nne()*i + kkindex(isz, isx);
+	// 		m_id.rhs[index].r =  -1.0f/(m_hx*m_hx);
+	// 	}
+
+	if(nRhs > m_ShotNum)
+	{	
+		for (int i=m_ShotNum;i<nRhs;i++)
+		{			
+			int recX = int(chan[0].pos.lx / m_hx) + m_npmlx;
+			int recZ = int(chan[0].pos.lz / m_hz) + m_npmlz;
+			int index= nne()*i + kkindex(recZ, recX + ds*(i-m_ShotNum));
+			m_id.rhs[index].r = -1.0f/(m_hx*m_hx);	
+		}	
+	}
+
+
+
+}
+
+//震源FFT变换
+void fwt::ProcSource(int nt, int ntnew, int r, complex<float>  *f_source, sType type)
+{
+
+	complex<float> *t_source =new complex<float>[ntnew];	
+	for (int i=0;i<nt;i++)
+	{
+		//if(type ==sins)
+			//t_source[i]=(float)SourceG(i,sins,12.21);       单频测sin函数的时候采用
+		//else
+		t_source[i]=(float)SourceG(i,type);                    //震源，采样点数作为时间参数？
+	}
+	//Augment source wavelet if necessary for FFT	
+	for (int i=nt;i<ntnew;i++)
+	{
+		t_source[i]=0;
+	}
+	FFT(t_source,f_source,r);                            //FFT
+	delete []t_source;
+}
+
+//获取梯度
+float fwt::GetGradient(int iw,complex<float> omegac,complex<float> source,vector<float> &grad)
+{
+	float cost0 = 0;	
+	complex<float> *temp_sol = new complex<float>[nne()*m_ShotNum];   //pressure field
+  ///*
+    //complex<float> *temp_solt = new complex<float>[nne()*m_ShotNum];   //si pressure field
+   // complex<float> *temp_soltb = new complex<float>[nne()*m_ShotNum];	// si field back
+    //complex<float> **temp=new complex<float>*[nne()*m_ShotNum];//A-1(p)
+	/*for(int i=0;i<nne()*m_ShotNum;i++)
+	{
+		temp[i]=new complex<float>[nne()*m_ShotNum];
+	}
+	complex<float> k=0; //p*(tm-td)
+	//*/
+	vector<complex<float> > gcal(ntrace());   // calculated data
+
+	SetNRhs(m_ShotNum,iw);
+	Forward(m_vel,omegac,source,gcal);
+
+	
+	complex<float> cc = SourceEstimate(m_gobs[iw],gcal);             //震源估计
+
+	for (int i=0; i< nne()*m_ShotNum; i++)
+	{
+		temp_sol[i] = complex<float>(m_id.rhs[i].r, m_id.rhs[i].i);//save the presssure field:p
+		m_id.rhs[i].r = 0;
+		m_id.rhs[i].i = 0;//清空，为导入残差波场做准备
+		//temp_solt[i]=0;
+		//temp_solt[i].i=0;//reset all elements ,for put in the residual 
+	}
+
+	//receive point
+	for (int ishot=0; ishot<m_ShotNum; ishot++)	
+	{
+		for (int irec=0; irec< m_RecNum; irec++)
+		{
+			complex<float> Residual = m_gobs[iw][ishot*m_RecNum+irec] - cc*gcal[ishot*m_RecNum+irec]; 
+			//complex<float> Residual = m_gobs[iw][ishot*m_RecNum+irec]*conj(m_gobs[iw][ishot*m_RecNum])/norm(m_gobs[iw][ishot*m_RecNum]) - cc*gcal[ishot*m_RecNum+irec]*conj(gcal[ishot*m_RecNum])/norm(gcal[ishot*m_RecNum]);  //si
+			//complex<float> Residual = log(gcal[ishot*m_RecNum+irec] / m_gobs[iw][ishot*m_RecNum+irec]);
+
+			cost0 += norm(Residual) ;
+
+			complex<float> temp_rhs = -conj(Residual) / (m_hx*m_hx); //对数域要去掉负号*gcal[ishot*m_RecNum+irec] ，conj是求共轭			
+			int ii = ishot * nne() + GetRecIndex(ishot,irec);
+			m_id.rhs[ii].r = temp_rhs.real();
+			m_id.rhs[ii].i = temp_rhs.imag();
+			//temp_solt[ii] = Residual; //si    T-Td   
+		}
+	}	
+	//receive point    归一化残差    source-independent
+	
+	/*
+	complex<float> stand; //  select recieve irec
+	for (int ishot=0; ishot<m_ShotNum; ishot++)	
+	{
+			      
+			complex<float>  stand_obs=m_gobs[iw][ishot*m_RecNum+1];
+			complex<float>  stand_cal=gcal[ishot*m_RecNum+1]
+			complex<float> Residual = m_gobs[iw][ishot*m_RecNum+irec]/stand_obs - cc*gcal[ishot*m_RecNum+irec]/stand_cal;
+			cost0 += norm(Residual) ;
+
+			complex<float> temp_rhs = -conj(Residual) / (m_hx*m_hx); //对数域要去掉负号*gcal[ishot*m_RecNum+irec]	 ，conj是求共轭			
+			int ii = ishot * nne() + GetRecIndex(ishot,irec);
+			m_id.rhs[ii].r = temp_rhs.real();
+			m_id.rhs[ii].i = temp_rhs.imag();
+		
+	}	
+	*/
+
+	//	func_mumps(m_ShotNum,SparseRhs,sol);
+	m_id.job = 3;
+	cmumps_c(&m_id);     //将残差波场数据导入，解出来的就是A的逆，乘以波场残差了。mumps的目的就是解出来A，然后乘以source，只是刚开始source为1而已。
+
+	//保存残差波场正演的数据   si
+	/*
+	for (int q=0; q< nne()*m_ShotNum; q++)
+	{
+		temp_soltb[q] = complex<float>(m_id.rhs[q].r, m_id.rhs[q].i);//save the can cha(t) field	A(-1)
+	}
+	//delete []m_id.rhs;
+	//*/
+	//compute p*(t-td)
+	/*
+	for(int n=0;n< nne()*m_ShotNum;n++)
+	{
+		k+= temp_sol[n]*temp_solt[n];
+		
+	}
+	//*/
+	//遍历grad第二部分的A逆解（依次传入p）
+	/*
+	for(int j=0;j<nne()*m_ShotNum;j++)
+	{
+	m_id.rhs = new CMUMPS_COMPLEX[nne()*m_ShotNum];
+		for(int m=0;m<nne()* m_ShotNum;m++)
+	{
+		m_id.rhs[m].r = 0;
+		m_id.rhs[m].i = 0;
+		
+	}
+	    m_id.rhs[j].r = temp_sol[j].real()/(m_hx*m_hx);
+		m_id.rhs[j].i = temp_sol[j].imag()/(m_hx*m_hx);
+	m_id.job = 3;
+	cmumps_c(&m_id);
+	
+	for (int i=0; i< nne()*m_ShotNum; i++)
+	{
+		temp[j][i] = complex<float>(m_id.rhs[i].r, m_id.rhs[i].i);//save the can cha(t) field	A(-1)
+	}
+	delete []m_id.rhs;
+	}
+	*/
+	// 		compute the gradient		
+	
+	for(int i = 0; i < nn(); i++)   //grad第一部分
+	{
+		int ii = TranIndex(i);
+		grad[i]=0;										// clear everytime 
+		complex<float> dx = -2.0f * pow(omegac,2) * cc *source / pow(m_vel[i], 3);	//derivative of impedance matrix coefficients with respect to model parameter
+		for (int m = 0;m < m_ShotNum; m++)	
+		{
+
+			int index = m*nne()+ii;
+	      //complex <float> stand=temp_sol[m*nne()];
+			complex <float> sol = complex <float>(m_id.rhs[index].r, m_id.rhs[index].i);//backpro wavefield
+			//complex <float> temp_grad = dx*temp_sol[index]*temp_soltb[index];
+			complex <float> temp_grad = dx*temp_sol[index]*sol;
+		  //complex <float> temp_grad = dx*temp_sol[index]*temp_soltb[index]*conj(stand)/norm(stand);
+		  ///complex <float> temp_grad = dx*temp_sol[index]*temp_soltb[index]*conj(stand)/norm(stand)+dx*k*temp[index][0]/pow(stand,2);      //si  the receive point
+			grad[i] += temp_grad.real();				
+		}
+	}
+	/*for(int i=0;i<nne()*m_ShotNum;i++)
+	{
+		delete[] temp[i];
+	}
+	delete temp;
+		
+	*/
+	delete []temp_sol;
+	//delete []temp_solt;
+	//delete []temp_soltb;
+	
+	//*/
+	return cost0;
+}
+
+//获取黑塞矩阵
+void fwt::GetHessian(complex<float> omegac, complex<float> sour, int iw, vector<float> &hess,ofstream &outfile)
+{		
+	vector<complex<float> > gcal(ntrace());
+	/*
+	complex<float> *temp1 = new complex<float>[nne()*nne()];
+	complex<float> *temp=new complex<float>[nne()*m_ShotNum];
+	
+	 complex<float> **temp_copy=new complex<float>*[nne()*m_ShotNum];//A-1(p)
+	for(int i=0;i<nne()*m_ShotNum;i++)
+	{
+		temp_copy[i]=new complex<float>[nne()*m_ShotNum];
+	}
+	*/
+	//int trace = (int)(chan[m_ShotNum*m_RecNum - 1].pos.lx - chan[0].pos.lx) / 25 +1;
+	
+	int trace = 0;
+	int nRhs = m_ShotNum + trace;	
+	delete []m_id.rhs;
+	m_id.rhs = new CMUMPS_COMPLEX[nne()*(nRhs)];
+	SetNRhs(nRhs,iw);
+	Forward(m_vel,omegac,sour,gcal);
+	//将波场维数扩大，并将原有波场赋值进去
+	/*
+	for (int i=0; i< nne()*m_ShotNum; i++)
+	{
+		temp[i] = complex<float>(m_id.rhs[i].r, m_id.rhs[i].i);//save the presssure field:p
+		
+	}
+	delete []m_id.rhs;
+	for (int o=0; o< nne()*nne(); o++)
+	{
+		temp1[o]=0;
+		
+		
+	}
+	
+	for(int p=0;p<nn();p++)
+	{
+	int q = TranIndex(p);
+	for(int irec=0;irec< m_RecNum;irec++)
+	{
+	temp1[GetRecIndex(0,irec)*nne()+q]=temp[GetRecIndex(0,irec)*nne()+q];
+	}
+	}
+	*/
+	//遍历grad第二部分的A逆解（依次传入p）
+	/*
+	for(int r=0;r<nne()*m_ShotNum;r++)
+	{
+	m_id.rhs = new CMUMPS_COMPLEX[nne()*m_ShotNum];
+		for(int m=0;m<nne()* m_ShotNum;m++)
+	{
+		m_id.rhs[m].r = 0;
+		m_id.rhs[m].i = 0;
+		
+	}
+	    m_id.rhs[r].r = temp[r].real()/(m_hx*m_hx);
+		m_id.rhs[r].i = temp[r].imag()/(m_hx*m_hx);
+	m_id.job = 3;
+	cmumps_c(&m_id);
+	
+	for (int i=0; i< nne()*m_ShotNum; i++)
+	{
+		temp_copy[r][i] = complex<float>(m_id.rhs[i].r, m_id.rhs[i].i);//save the can cha(t) field	A(-1)
+	}
+	delete []m_id.rhs;
+	}
+	
+	*/
+	complex<float> cc = SourceEstimate(m_gobs[iw],gcal);
+
+	outfile << cc <<endl;
+	
+	complex<float> sol_shot,sol_rec;
+	complex<float> stand;
+	//compute the hessian
+	//#pragma omp parallel 
+	for (int i = 0; i < nn(); i++)
+	{
+		complex<float> dx = -2.0f* pow(omegac,2)*cc*sour/pow(m_vel[i], 3);	
+		hess[i] = 0;	
+		int ii = TranIndex(i);
+		for (int is = 0; is < m_ShotNum; is++) 
+		{
+ 			///*
+			for (int ir = 0; ir < m_RecNum; ir++)
+ 			{
+				
+				sol_shot = complex<float>(m_id.rhs[is*nne()+ii].r, m_id.rhs[is*nne()+ii].i);				
+				//int index = (int)(chan[is*m_RecNum+ir].pos.lx -chan[0].pos.lx)/ 25 + m_ShotNum;
+				sol_rec =  complex<float>(m_id.rhs[ir*nne() + ii].r, m_id.rhs[ir*nne() + ii].i);					
+				hess[i] +=  norm(dx*sol_shot*sol_rec);					
+			}
+			//*/
+			/*
+			for(int ir=0;ir<nne();ir++)
+			{
+				stand=temp[is*nne()];
+				sol_shot=temp[is*nne()+ii];
+				sol_rec=temp1[ir*nne()+ii]*conj(stand)/norm(stand);
+				hess[i] += norm(dx*sol_shot*sol_rec+dx*temp_copy[is*nne()+ii][0]*sol_shot/pow(stand,2));
+			}
+			*/
+		}		
+	}
+	/*
+	for(int i=0;i<nne()*m_ShotNum;i++)
+	{
+		delete[] temp_copy[i];
+	}
+	delete temp_copy;
+	///*
+	delete []temp;
+	delete []temp1;	
+	*/
+	
+	delete []m_id.rhs;
+	m_id.rhs = new CMUMPS_COMPLEX[nne()*(m_ShotNum)];
+
+}
+
+//求函数的最小值
+float fwt::Fcost(float alpha,const vector<float> &grad,int iw,complex<float> omegac,complex<float> sour)
+{
+	float cost = 0;	
+	vector<complex<float> > gcal(ntrace());
+	vector<float> vup(nn()) ;
+
+	//Update the model using the step length computed previously
+	for (int i=0;i<nn();i++)	
+	{
+		vup[i] = m_vel[i] + alpha*grad[i];
+	}
+
+	SetNRhs(m_ShotNum,iw);
+	Forward(vup,omegac,sour,gcal);	
+	complex<float> cc = SourceEstimate(m_gobs[iw],gcal);
+
+	//compute the residuals and cost function
+	for (int ishot=0;ishot<m_ShotNum;ishot++)	
+	{
+		for (int irec=0; irec< m_RecNum; irec++)
+		{
+			//complex<float>Residual = m_gobs[iw] [ishot*m_decimation*m_decimation*m_RecNum+irec*m_decimation] - cc*gcal[ishot*m_RecNum+irec];		
+			complex<float>Residual = m_gobs[iw] [ishot*m_RecNum+irec] - cc*gcal[ishot*m_RecNum+irec];			
+			//complex<float>Residual = log(gcal[ishot*m_RecNum+irec] / m_gobs[iw][ishot*m_RecNum+irec]);		
+			cost += norm(Residual) ;
+		}	
+	}
+
+	return cost;
+}
+
+//抛物线拟合中X的取值
+float fwt::StepLength(float cost0 ,const vector<float> &grad,int iw,complex<float> omegac,complex<float> sour)
+{
+	//search the maxima of the gradient	
+	float GradMax=-1;
+	int imax;	
+	for (int i=0;i<nn();i++)
+	{
+		if (fabs(grad[i]) > GradMax)
+		{
+			GradMax = fabs(grad[i]);
+			imax = i;
+		}
+	}
+
+	//3 values of the cost function corresponding to 3 values of the step length(alpha)
+	float alpha[3],cost[3];
+	alpha[0]=0;	
+	cost[0] = cost0;
+
+	//SetNRhs(m_ShotNum);
+	//compute a first step length,cost1 be smaller than cost0
+	static float xper1 = 0.03f;
+	int niter1 = 0;
+	while (1)
+	{
+		//compute a step length for steepest-descent algorithm
+		alpha[1] = xper1*m_vel[imax]/GradMax;		
+		cost[1] = Fcost(alpha[1],grad,iw,omegac,sour);
+
+		if (cost[1] > cost[0])
+		{
+			if(niter1++ < 5)  		xper1 /= 2;  			
+			else  return 0;    //cann't find a step length, move to next frequency
+		}
+		else break;
+	}
+
+	//compute a second step length, larger than the first one		
+	while (1)
+	{		
+		float xper2  = 2*xper1;
+		//compute a step length for steepest-descent algorithm
+		alpha[2] = xper2*m_vel[imax]/GradMax;
+		cost[2] = Fcost(alpha[2],grad,iw,omegac,sour);
+		if (cost[2] < cost[1])
+		{
+			xper1 = xper2;
+			alpha[1] = alpha[2];
+			cost[1] = cost[2];		
+			//xper2 *= 2;
+		}
+		else break;
+	}
+
+	//FIND THE OPTIMAL STEP LENGTH BY PARABOLA FITTING
+	float alphamin = ParaFit(alpha,cost,3);//求取极值点
+	return alphamin;			
+}
+
+
+float fwt::StepLength(const vector<float> &grad, const vector<float> & hess)
+{
+	float a = 0,b = 0;
+	for (int i = 0; i < nn(); i ++)
+	{
+		a += grad[i] * grad[i];
+		b += grad[i] *hess[i] *grad[i];
+	}
+	return -a/b;
+}
+
+//梯度预处理
+void fwt::ScaleGrad(const vector<float> &hess, vector<float> &grad)
+{
+	float hessmax = -1;
+	for (int i=0;i<nn();i++)
+	{
+		if (fabs(hess[i]) > hessmax)
+		{
+			hessmax = fabs(hess[i]);
+		}
+	}
+	float damp = 5e-4f * hessmax;
+	for (int i=0;i<nn();i++)
+	{
+		grad[i] = grad[i]/(hess[i]+damp);   //PGN预处理
+	}
+}
+
+//生成网格慢度mat文件
+bool fwt::Createvelocitymat(int iter)
+{	
+	MATFile *pmat;
+	mxArray *pslow;//定义结构体的指针，二维数组，用来保存(i,j)格点走时
+
+	char buff[10];
+	string tmpfile = "iter";
+	_itoa_s(iter, buff, 10,10);
+	tmpfile += buff;
+	tmpfile += ".mat";
+	const char *filename = tmpfile.c_str();
+
+	mwSize ndims[2];
+
+	/*
+	*保存三维数组的每一维尺寸,从低维到高维的尺寸排列
+	*另外强调一点，C语言数组的序列是以行元素优先排列的，
+	*而matlab和vc++都是以列元素优先的
+	*
+	*/
+	ndims[0]=m_nz;
+	ndims[1]=m_nx;
+
+	//创建mxArray结构体并为其赋值
+	pslow=mxCreateNumericArray(2,ndims, mxDOUBLE_CLASS,mxREAL);
+
+	double *pr=mxGetPr(pslow);//获取数组的实部数据指针
+
+	//	vector<double>::iterator pvec;   //迭代器指针
+	//float *pvec;
+	//pvec = &m_vel[0];
+	//memcpy(pr,pvec,m_nx*m_nz*sizeof(float));
+	for (int i=0;i<nn();i++)
+	{
+		pr[i] =m_vel[i];
+	}
+	//把容器中的内容复制到ptime所指mxArray结构体实部的内存区域
+
+
+	pmat=matOpen(filename,"w");
+	if(pmat==NULL)
+	{
+		::AfxMessageBox("Error creating file GridVelocity.mat!");
+		return FALSE;
+	}
+
+	//向mat文件中写入数据，即写入结构体mxArray
+	matPutVariable(pmat,"GridVelocity",pslow);
+
+	matClose(pmat);
+	mxDestroyArray(pslow);
+
+	return TRUE;
+}
+
+
+void fwt::MumpsInitial(void)
+{
+	m_id.job = -1; /* init library */
+	m_id.par = 1;  /* this processor participates */
+	m_id.sym = 0;  /* unsymmetric  */
+	//	id.comm_fortran = -987654; /* use comm_world */
+	cmumps_c(&m_id);
+	int nn = nne() * 9;
+	m_id.irn = new int[nn];
+	m_id.jcn = new int[nn];
+	m_id.a = new CMUMPS_COMPLEX[nn];
+
+	//int trace = (int)(chan[m_ShotNum*m_RecNum - 1].pos.lx - chan[0].pos.lx) / 25 +1;
+	int trace = 0;
+	m_id.rhs = new CMUMPS_COMPLEX[nne()*(m_ShotNum+trace)];
+	m_id.lrhs = nne();
+	m_id.n  = nne();
+
+	m_id.icntl[20-1]=0;  //1 for sparse right-hand-side, 0 for dense
+	m_id.icntl[21-1]=0;
+	m_id.icntl[7-1]= 0;      //*! */ordering
+	m_id.icntl[8-1]=7;      //*! */Scaling
+	m_id.icntl[14-1]=30;
+}
+
+
+void fwt::MumpsEnd(void)
+{
+	m_id.job = -2; /* release library */
+	cmumps_c(&m_id);
+	delete []m_id.irn;
+	delete []m_id.jcn;
+	delete []m_id.a;
+	delete []m_id.rhs;
+}
+
+
+int fwt::GetRecIndex(int is, int ir)
+{
+	// 	int recX = int(chan[is*m_RecNum + ir].pos.lx / m_hx) + m_npmlx;
+	//  	int recZ = int(chan[is*m_RecNum + ir].pos.lz / m_hz) + m_npmlz;
+	int dr = 4;
+	int recX = ir*dr+m_npmlx;
+	int recZ = 0+m_npmlz;
+	int index = kkindex(recZ,recX);		 
+	return index;
+}
+
+
+complex<float> fwt:: SourceEstimate(const vector<complex<float> > &gobs,const vector<complex<float> > &gcal)
+{
+		/*complex<float> cc1 = 0;
+	  	complex<float> cc2 = 0;
+	  	for (unsigned int i = 0; i < gcal.size(); i++)
+	 	{
+	 		cc1 += conj(gcal[i]) * gobs[i];            //gob get from first source  conj gob into  conj gcal
+	  		cc2 += norm(gcal[i]);
+	 	}
+	  	return (cc1/cc2);*/
+	return 1;
+	//return 1.0f / gcal[0];
+}
+
+
+void fwt::GetOberserveData(int nt, int r, int ntnew, int NW, int *iiw)
+{
+	int NTrace = m_RecNum * m_ShotNum;
+	complex<float> (*dataT)[1024] = new complex<float>[NTrace][1024];
+	complex<float> (*dataF)[1024] = new complex<float>[NTrace][1024];
+	memset(dataT, 8*NTrace*ntnew, 0);
+	for(int i = 0; i < NTrace; i++)	
+	{
+		for (int  j = 0; j < nt; j++)
+		{
+			dataT[i][j] = chan[i].sample[j];
+		}
+		FFT(dataT[i], dataF[i] ,r);
+
+	}
+	//SaveResult("mumps",0,dataF,m_RecNum,1024/2);	
+
+	for(int iw = 0; iw < NW; iw++)
+	{
+		for(int j = 0; j < NTrace; j++)
+		{
+			int index = iiw[iw] ;
+			m_gobs[iw][j] = dataF[j][index] /*/ dataF[0][index] */;
+		}
+		//Normalize(&m_gobs[iw],m_RecNum*m_ShotNum);
+	}
+	delete []dataF;
+	delete []dataT;
+
+	// 	CFile cf;
+	// 	cf.Open("fdata",CFile::modeCreate|CFile::modeWrite);
+	// 	int length = sizeof(complex<float>) * NTrace*7;
+	// 	cf.Write(&m_gobs[0][0],length);
+	// 	cf.Close();
+}
+
+
+void fwt::DirectSolve()
+{	
+	vector<complex<float>> rhs(nne());
+	for (int i = 0; i < nne(); i++)
+	{
+		rhs[i] = complex<float >(m_id.rhs[i].r, m_id.rhs[i].i);
+	}
+
+	m_id.n = 3;
+	m_id.nz = 7;
+
+	m_id.irn = new int[m_id.nz];
+	m_id.jcn = new int[m_id.nz];
+	m_id.a = new CMUMPS_COMPLEX[m_id.nz];
+
+	m_id.irn[0] = 1;
+	m_id.jcn[0] = 1;
+	m_id.a[0].r = 1;
+	m_id.a[0].i = 0;
+
+	m_id.irn[1] = 1;
+	m_id.jcn[1] = 2;
+	m_id.a[1].r = 2;
+	m_id.a[1].i = 0;
+
+	m_id.irn[2] = 2;
+	m_id.jcn[2] = 1;
+	m_id.a[2].r = 3;
+	m_id.a[2].i = 0;
+
+	m_id.irn[3] = 2;
+	m_id.jcn[3] = 2;
+	m_id.a[3].r = 4;
+	m_id.a[3].i = 0;
+
+	m_id.irn[4] = 3;
+	m_id.jcn[4] = 1;
+	m_id.a[4].r = 5;
+	m_id.a[4].i = 0;
+
+
+	m_id.irn[5] = 3;
+	m_id.jcn[5] = 3;
+	m_id.a[5].r = 3;
+	m_id.a[5].i = 0;
+
+	m_id.irn[6] = 1;
+	m_id.jcn[6] = 3;
+	m_id.a[6].r = 3;
+	m_id.a[6].i = 0;
+
+	Matrix *matrix = new Matrix;
+	matrix->CreatMatrix(m_id);
+//	matrix->ILU();
+	matrix->LUFactory();
+	AfxMessageBox("OK2!");
+	matrix->LUSolve(rhs);
+	//AfxMessageBox("OK3!");
+	for (int i = 0; i < nne(); i++)
+	{
+		m_id.rhs[i].r = rhs[i].real();
+		m_id.rhs[i].i = rhs[i].imag();
+	}
+	delete matrix;
+
+}
+
+//无衰减作用
+void fwt::undamp(complex<float> *sis, int nt)
+{
+	for (int i = 0; i < nt; i++)
+	{
+		float t = i*m_tstep;
+		sis[i] *= exp(t*log(50.0f)/m_tsearch);
+	}
+}
+
+
+void fwt::gmres(engine *pEngine)
+{
+	// 	m_id.n = 3;
+	// 	m_id.nz = 4;
+
+	mxArray *pRhs = mxCreateDoubleMatrix(m_id.n, 1, mxCOMPLEX);
+	double *rhs_pr = mxGetPr(pRhs);
+	double *rhs_pi = mxGetPi(pRhs);
+	for (int i = 0; i < m_id.n; i++)
+	{
+		rhs_pr[i] = m_id.rhs[i].r;
+		rhs_pi[i] = m_id.rhs[i].i;
+		//  		rhs_pr[i] = i+1;
+		//  		rhs_pi[i] = 0;
+	}
+
+	mxArray *pMatrix = mxCreateSparse(m_id.n, m_id.n, m_id.nz,mxCOMPLEX);
+	double *pr = mxGetPr(pMatrix);
+	double *pi = mxGetPi(pMatrix);
+	mwIndex *ir = mxGetIr(pMatrix);
+	mwIndex *jc = mxGetJc(pMatrix);
+	int col = 0;
+	for(int i = 0; i < m_id.nz; i++)
+	{
+		pr[i] = m_id.a[i].r;
+		pi[i] = m_id.a[i].i;
+		ir[i] = m_id.jcn[i] - 1;
+		if (m_id.irn[i]-1 == col)
+		{
+			jc[col++] = i;			
+		}		
+	}
+	jc[col] = m_id.nz;
+
+	// 	pr[0] = 2;
+	// 	pi[0] = 0;
+	// 	ir[0] = 1;
+	// 	jc[0] = 0;
+	// 
+	// 	pr[1] = 1;
+	// 	pi[1] = 0;
+	// 	ir[1] = 2;
+	// 	jc[1] = 2;
+	// 
+	// 	pr[2] = 1;
+	// 	pi[2] = 0;
+	// 	ir[2] = 0;
+	// 	jc[2] = 3;
+	// 
+	// 	pr[3] = 3;
+	// 	pi[3] = 0;
+	// 	ir[3] = 2;
+	// 	jc[3] = 4;
+	engPutVariable(pEngine, "A", pMatrix);
+	engPutVariable(pEngine, "b", pRhs);/*setup.type = 'nofill';setup.droptol = 1e-2;*/
+	//engEvalString(pEngine, "setup.droptol = 1e-3;  [L,U] = ilu(A,setup)");
+	//	engEvalString(pEngine, "[L,U] = luinc(A,1e-2)");
+	//engEvalString(pEngine, "x = gmres(A, b, 10,1e-6, 10, L, U);");
+	engEvalString(pEngine, "x = lsqr(A, b, [], 500);");
+
+	// 	engEvalString(pEngine, "[L,U]= lu(A)");
+	// 	engEvalString(pEngine, "y= L\\b");	+
+	// 	engEvalString(pEngine, "x= U\\y");	
+
+	//  	if ( engEvalString(pEngine, "x = A\\b") )
+	// 	{
+	// 		AfxMessageBox("execute error!");
+	// 	}
+
+	mxArray *px = engGetVariable(pEngine, "x");
+
+	double *x_pr = mxGetPr(px);
+	double *x_pi = mxGetPi(px);
+
+	for (int i = 0; i < m_id.n; i++)
+	{
+		m_id.rhs[i].r = x_pr[i] ;
+		m_id.rhs[i].i = x_pi[i] ;
+	}	
+
+	mxDestroyArray(pRhs);
+	mxDestroyArray(pMatrix);
+	mxDestroyArray(px);
+}
+
+
+complex<float> fwt::GetOmegac(int ii, float df, int ia)
+{
+	float freq = df*ii;
+	complex<float> omegac = complex<float>(2*PI*freq, -2*ia);
+	return omegac;
+}
